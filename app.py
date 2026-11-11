@@ -5,13 +5,13 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import Response
 
 
 app = FastAPI(
     title="LaTeX compiler",
-    version="1.0.1",
+    version="1.1.0",
 )
 
 
@@ -48,40 +48,57 @@ def safe_extract(
     archive: Path,
     destination: Path,
 ) -> None:
-    """Safely extract an uploaded ZIP archive."""
+    """Safely extract a ZIP archive."""
 
     destination_resolved = destination.resolve()
 
-    with zipfile.ZipFile(archive) as zf:
+    try:
+        with zipfile.ZipFile(archive) as zf:
 
-        for member in zf.infolist():
+            total_uncompressed = 0
 
-            target = (
-                destination / member.filename
-            ).resolve()
+            for member in zf.infolist():
 
-            if not str(target).startswith(
-                str(destination_resolved) + os.sep
-            ):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Unsafe path in ZIP archive",
-                )
+                target = (
+                    destination / member.filename
+                ).resolve()
 
-            if member.file_size > MAX_UPLOAD_BYTES:
-                raise HTTPException(
-                    status_code=413,
-                    detail="A ZIP member is too large",
-                )
+                if not str(target).startswith(
+                    str(destination_resolved) + os.sep
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Unsafe path in ZIP archive",
+                    )
 
-        zf.extractall(destination)
+                if member.file_size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="A ZIP member is too large",
+                    )
+
+                total_uncompressed += member.file_size
+
+                if total_uncompressed > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Uncompressed ZIP contents are too large",
+                    )
+
+            zf.extractall(destination)
+
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid ZIP archive",
+        ) from exc
 
 
 async def save_upload(
     upload: UploadFile,
     target: Path,
 ) -> None:
-    """Save an UploadFile while enforcing the upload limit."""
+    """Save an uploaded file with a size limit."""
 
     total = 0
 
@@ -103,11 +120,10 @@ async def save_upload(
 def run(
     command: list[str],
     cwd: Path,
-) -> subprocess.CompletedProcess[str]:
+) -> subprocess.CompletedProcess:
     """Run a compiler command with a timeout."""
 
     try:
-
         return subprocess.run(
             command,
             cwd=cwd,
@@ -123,7 +139,6 @@ def run(
         )
 
     except subprocess.TimeoutExpired as exc:
-
         raise HTTPException(
             status_code=408,
             detail=(
@@ -137,20 +152,29 @@ def compile_tex(
     workdir: Path,
     main_file: str,
 ) -> Path:
-    """Compile one LaTeX document using latexmk."""
+    """Compile a LaTeX document using latexmk."""
 
     main = (workdir / main_file).resolve()
     workdir_resolved = workdir.resolve()
 
-    if (
-        not str(main).startswith(
-            str(workdir_resolved) + os.sep
-        )
-        or not main.is_file()
+    if not str(main).startswith(
+        str(workdir_resolved) + os.sep
     ):
         raise HTTPException(
             status_code=400,
-            detail="main_file is invalid or missing",
+            detail="Invalid main file path",
+        )
+
+    if not main.is_file():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Main LaTeX file not found: {main_file}",
+        )
+
+    if main.suffix.lower() != ".tex":
+        raise HTTPException(
+            status_code=400,
+            detail="Main file must be a .tex file",
         )
 
     result = run(
@@ -190,11 +214,9 @@ def compile_tex(
 def pdf_response(
     pdf: Path,
     filename: str,
-) -> Response:   
-    """Read the PDF into memory before TemporaryDirectory is removed.
-
-    This avoids returning a FileResponse referring to a temporary
-    file that no longer exists when Starlette sends the response.
+) -> Response:
+    """
+    Read the PDF before the temporary directory is removed.
     """
 
     pdf_bytes = pdf.read_bytes()
@@ -216,6 +238,7 @@ def health():
     return {
         "status": "ok",
         "service": "latex-compiler",
+        "version": "1.1.0",
     }
 
 
@@ -226,16 +249,13 @@ async def compile_project(
     authorization: str | None = Header(default=None),
 ):
     """
-    Compile a ZIP containing a LaTeX project.
+    Compile a LaTeX project supplied as multipart/form-data.
 
-    Multipart fields:
-
+    Fields:
         project    ZIP archive
-        main_file  main LaTeX filename
+        main_file  main .tex filename
 
-    Returns:
-
-        application/pdf
+    This endpoint is useful with curl and conventional HTTP clients.
     """
 
     authorise(authorization)
@@ -254,28 +274,100 @@ async def compile_project(
         source = workdir / "source"
         source.mkdir()
 
-        try:
-
-            safe_extract(
-                archive,
-                source,
-            )
-
-        except zipfile.BadZipFile as exc:
-
-            raise HTTPException(
-                status_code=400,
-                detail="project must be a ZIP archive",
-            ) from exc
+        safe_extract(
+            archive,
+            source,
+        )
 
         pdf = compile_tex(
             source,
             main_file,
         )
 
-        # IMPORTANT:
-        # pdf_response reads the PDF bytes here,
-        # while TemporaryDirectory still exists.
+        return pdf_response(
+            pdf,
+            "result.pdf",
+        )
+
+
+@app.post("/compile-zip")
+async def compile_zip(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_main_file: str = Header(
+        default="main.tex",
+        alias="X-Main-File",
+    ),
+):
+    """
+    Power Automate-friendly compilation endpoint.
+
+    Request:
+        Content-Type: application/zip
+        Authorization: Bearer ...
+        X-Main-File: main.tex
+
+    Body:
+        Raw ZIP data
+
+    Response:
+        Raw PDF data.
+    """
+
+    authorise(authorization)
+
+    content_length = request.headers.get("content-length")
+
+    if content_length is not None:
+
+        try:
+            declared_size = int(content_length)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Content-Length",
+            )
+
+        if declared_size > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="Upload is too large",
+            )
+
+    body = await request.body()
+
+    if not body:
+        raise HTTPException(
+            status_code=400,
+            detail="Request body is empty",
+        )
+
+    if len(body) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Upload is too large",
+        )
+
+    with tempfile.TemporaryDirectory() as temporary:
+
+        workdir = Path(temporary)
+
+        archive = workdir / "project.zip"
+
+        archive.write_bytes(body)
+
+        source = workdir / "source"
+        source.mkdir()
+
+        safe_extract(
+            archive,
+            source,
+        )
+
+        pdf = compile_tex(
+            source,
+            x_main_file,
+        )
 
         return pdf_response(
             pdf,
@@ -290,8 +382,8 @@ async def compile_diff(
     authorization: str | None = Header(default=None),
 ):
     """
-    Compare two self-contained LaTeX files using latexdiff,
-    compile the resulting diff.tex, and return the PDF.
+    Compare two self-contained .tex files using latexdiff
+    and return the compiled comparison as a PDF.
     """
 
     authorise(authorization)
@@ -312,8 +404,6 @@ async def compile_diff(
             new_file,
             new_path,
         )
-
-        diff_path = workdir / "diff.tex"
 
         result = run(
             [
@@ -340,6 +430,8 @@ async def compile_diff(
                 },
             )
 
+        diff_path = workdir / "diff.tex"
+
         diff_path.write_text(
             result.stdout,
             encoding="utf-8",
@@ -349,9 +441,6 @@ async def compile_diff(
             workdir,
             "diff.tex",
         )
-
-        # Again, read the result before the temporary
-        # directory disappears.
 
         return pdf_response(
             pdf,
