@@ -190,7 +190,7 @@ def compile_tex(
 def pdf_response(
     pdf: Path,
     filename: str,
-) -> Response   
+) -> Response:   
     """Read the PDF into memory before TemporaryDirectory is removed.
 
     This avoids returning a FileResponse referring to a temporary
